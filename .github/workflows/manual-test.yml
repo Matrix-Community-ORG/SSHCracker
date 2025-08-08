@@ -9,20 +9,20 @@ on:
         default: 'basic'
         type: choice
         options:
-        - basic
-        - build-only
-        - security-scan
-        - performance-test
+          - basic
+          - build-only
+          - security-scan
+          - performance-test
       target_platform:
         description: 'Target platform for testing'
         required: true
         default: 'linux'
         type: choice
         options:
-        - linux
-        - windows
-        - macos
-        - all
+          - linux
+          - windows
+          - macos
+          - all
       enable_debug:
         description: 'Enable debug output'
         required: false
@@ -40,16 +40,24 @@ jobs:
       inputs.target_platform == 'macos' && 'macos-latest' || 
       'ubuntu-latest' 
     }}
-    
+
+    env:
+      TEST_TYPE: ${{ inputs.test_type }}
+      TARGET_PLATFORM: ${{ inputs.target_platform }}
+      ENABLE_DEBUG: ${{ inputs.enable_debug }}
+      CUSTOM_ARGS: ${{ inputs.custom_args }}
+
     steps:
     - name: Print test information
       run: |
         echo "🧪 Manual Testing Started"
-        echo "Test Type: ${{ github.event.inputs.test_type }}"
-        echo "Target Platform: ${{ github.event.inputs.target_platform }}"
-        echo "Debug Mode: ${{ github.event.inputs.enable_debug }}"
-        echo "Custom Args: ${{ github.event.inputs.custom_args }}"
-        echo "Runner OS: ${{ runner.os }}"
+        echo "Test Type: $TEST_TYPE"
+        echo "Target Platform: $TARGET_PLATFORM"
+        echo "Debug Mode: $ENABLE_DEBUG"
+        echo "Custom Args: $CUSTOM_ARGS"
+        echo "Runner OS: $RUNNER_OS"
+      env:
+        RUNNER_OS: ${{ runner.os }}
 
     - uses: actions/checkout@v4
 
@@ -62,78 +70,73 @@ jobs:
       run: go mod download
 
     - name: Basic tests
-      if: contains(inputs.test_type, 'basic')
+      if: inputs.test_type == 'basic'
       run: |
         echo "🔍 Running basic tests..."
-        go vet ssh.go
-        go build -v ssh.go
+        go vet ssh.go nla.go
+        go build -v ssh.go nla.go
         echo "✅ Basic tests completed"
 
     - name: Build-only test
-      if: contains(inputs.test_type, 'build-only')
+      if: inputs.test_type == 'build-only'
       run: |
         echo "🏗️ Running build-only test..."
-        
-        if [ "${{ inputs.target_platform }}" = "all" ]; then
+
+        if [ "$TARGET_PLATFORM" = "all" ]; then
           echo "Building for all platforms..."
-          
+
           # Linux
-          GOOS=linux GOARCH=amd64 go build -o ssh-linux-amd64 ssh.go
-          GOOS=linux GOARCH=arm64 go build -o ssh-linux-arm64 ssh.go
-          
+          GOOS=linux GOARCH=amd64 go build -o ssh-linux-amd64 ssh.go nla.go
+          GOOS=linux GOARCH=arm64 go build -o ssh-linux-arm64 ssh.go nla.go
+
           # Windows
-          GOOS=windows GOARCH=amd64 go build -o ssh-windows-amd64.exe ssh.go
-          
+          GOOS=windows GOARCH=amd64 go build -o ssh-windows-amd64.exe ssh.go nla.go
+
           # macOS
-          GOOS=darwin GOARCH=amd64 go build -o ssh-darwin-amd64 ssh.go
-          GOOS=darwin GOARCH=arm64 go build -o ssh-darwin-arm64 ssh.go
-          
+          GOOS=darwin GOARCH=amd64 go build -o ssh-darwin-amd64 ssh.go nla.go
+          GOOS=darwin GOARCH=arm64 go build -o ssh-darwin-arm64 ssh.go nla.go
+
           echo "📦 Built binaries:"
           ls -la ssh-*
         else
-          go build ${{ github.event.inputs.custom_args }} -o ssh-test ssh.go
+          go build $CUSTOM_ARGS -o ssh-test ssh.go nla.go
           echo "✅ Single platform build completed"
         fi
 
     - name: Security scan
-      if: contains(inputs.test_type, 'security-scan')
+      if: inputs.test_type == 'security-scan'
       run: |
         echo "🛡️ Running security scan..."
-        
-        # Install gosec if not available
+
         if ! command -v gosec &> /dev/null; then
           go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+          export PATH=$PATH:$(go env GOPATH)/bin
         fi
-        
-        # Run security scan
+
         gosec ./... || echo "Security scan completed with warnings"
-        
+
         echo "🔍 Checking for common vulnerabilities..."
         grep -r "password" --include="*.go" . || echo "No password strings found in code"
         grep -r "token" --include="*.go" . || echo "No token strings found in code"
-        
+
         echo "✅ Security scan completed"
 
     - name: Performance test
-      if: contains(inputs.test_type, 'performance-test')
+      if: inputs.test_type == 'performance-test'
       run: |
         echo "⚡ Running performance test..."
-        
-        # Build optimized binary
-        go build -ldflags="-s -w" -o ssh-perf ssh.go
-        
-        # Check binary size
+
+        go build -ldflags="-s -w" -o ssh-perf ssh.go nla.go
         echo "📏 Binary size:"
         ls -lh ssh-perf
-        
-        # Basic performance check
+
         echo "🚀 Binary info:"
         file ssh-perf
-        
+
         echo "✅ Performance test completed"
 
     - name: Debug information
-      if: ${{ github.event.inputs.enable_debug == 'true' }}
+      if: github.event.inputs.enable_debug == 'true'
       run: |
         echo "🐛 Debug Information"
         echo "==================="
@@ -164,12 +167,12 @@ jobs:
         retention-days: 7
 
   multi-platform-test:
-    if: inputs.target_platform == 'all'
+    if: ${{ github.event.inputs.target_platform == 'all' }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
     - name: Print platform info
       run: |
@@ -187,7 +190,7 @@ jobs:
       run: |
         echo "🏗️ Building for ${{ runner.os }}..."
         go mod download
-        go build -v ssh.go
+        go build -v ssh.go nla.go
         echo "✅ Build successful on ${{ runner.os }}"
 
     - name: Upload platform artifacts

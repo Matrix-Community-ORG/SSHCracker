@@ -51,12 +51,14 @@ We welcome feature requests! Please:
 - Add comments for complex logic
 - Keep functions focused and small
 - Handle errors appropriately
+- For NLA Checker, follow similar structure to SSHCracker for consistency
 
 ### Commit Messages
 - Use descriptive commit messages
 - Start with an emoji if appropriate
 - Keep the first line under 50 characters
 - Use the body to explain what and why
+- Use 🛡️ for NLA-related changes
 
 Example:
 ```

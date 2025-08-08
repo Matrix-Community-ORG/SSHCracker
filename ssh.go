@@ -72,6 +72,10 @@ type HoneypotDetector struct {
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
+	fmt.Print("Select mode (1: SSHCracker, 2: NLA Checker): ")
+	mode, _ := reader.ReadString('\n')
+	mode = strings.TrimSpace(mode)
+
 	createComboFile(reader)
 	fmt.Print("Enter the IP list file path: ")
 	ipFile, _ = reader.ReadString('\n')
@@ -91,8 +95,15 @@ func main() {
 	ips := getItems(ipFile)
 	totalIPCount = len(ips) * len(combos)
 
-	// Enhanced worker pool system
-	setupEnhancedWorkerPool(combos, ips)
+	if mode == "1" {
+		// Run SSHCracker
+		setupEnhancedWorkerPool(combos, ips)
+	} else if mode == "2" {
+		// Run NLA Checker
+		setupNLAWorkerPool(combos, ips)
+	} else {
+		log.Fatal("Invalid mode selected. Use 1 for SSHCracker or 2 for NLA Checker.")
+	}
 
 	banner()
 	fmt.Println("Operation completed successfully!")
@@ -637,12 +648,24 @@ func banner() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Use atomic operations for thread-safe reading
-		goods := atomic.LoadInt64(&stats.goods)
-		errors := atomic.LoadInt64(&stats.errors)
-		honeypots := atomic.LoadInt64(&stats.honeypots)
-		
-		totalConnections := int(goods + errors + honeypots)
+		totalConnections := int64(0)
+		var goods, errors, honeypots, nlaEnabled int64
+		var mode string
+
+		if mode == "1" { // SSHCracker mode
+			goods = atomic.LoadInt64(&stats.goods)
+			errors = atomic.LoadInt64(&stats.errors)
+			honeypots = atomic.LoadInt64(&stats.honeypots)
+			totalConnections = goods + errors + honeypots
+			mode = "SSHCracker"
+		} else if mode == "2" { // NLA Checker mode
+			goods = atomic.LoadInt64(&nlaStats.successes)
+			errors = atomic.LoadInt64(&nlaStats.errors)
+			nlaEnabled = atomic.LoadInt64(&nlaStats.nlaEnabled)
+			totalConnections = goods + errors + nlaEnabled
+			mode = "NLA Checker"
+		}
+
 		elapsedTime := time.Since(startTime).Seconds()
 		connectionsPerSecond := float64(totalConnections) / elapsedTime
 		estimatedRemainingTime := float64(totalIPCount-totalConnections) / connectionsPerSecond
@@ -650,14 +673,14 @@ func banner() {
 		clear()
 
 		fmt.Printf("================================================\n")
-		fmt.Printf("🚀 Advanced SSH Brute Force Tool v%s 🚀\n", VERSION)
+		fmt.Printf("🚀 Advanced %s v%s 🚀\n", mode, VERSION)
 		fmt.Printf("================================================\n")
 		fmt.Printf("📁 File: %s | ⏱️  Timeout: %ds\n", ipFile, timeout)
 		fmt.Printf("🔗 Max Workers: %d | 🎯 Per Worker: %d\n", maxConnections, CONCURRENT_PER_WORKER)
 		fmt.Printf("================================================\n")
-		fmt.Printf("🔍 Checked SSH: %d/%d\n", totalConnections, totalIPCount)
+		fmt.Printf("🔍 Checked: %d/%d\n", totalConnections, totalIPCount)
 		fmt.Printf("⚡ Speed: %.2f checks/sec\n", connectionsPerSecond)
-		
+
 		if totalConnections < totalIPCount {
 			fmt.Printf("⏳ Elapsed: %s\n", formatTime(elapsedTime))
 			fmt.Printf("⏰ Remaining: %s\n", formatTime(estimatedRemainingTime))
@@ -665,21 +688,32 @@ func banner() {
 			fmt.Printf("⏳ Total Time: %s\n", formatTime(elapsedTime))
 			fmt.Printf("✅ Scan Completed Successfully!\n")
 		}
-		
+
 		fmt.Printf("================================================\n")
-		fmt.Printf("✅ Successful: %d\n", goods)
-		fmt.Printf("❌ Failed: %d\n", errors)
-		fmt.Printf("🍯 Honeypots: %d\n", honeypots)
-		
-		if totalConnections > 0 {
-			// Calculate rates based on successful connections (goods + honeypots)
-			successfulConnections := goods + honeypots
-			if successfulConnections > 0 {
-				fmt.Printf("📊 Success Rate: %.2f%%\n", float64(goods)/float64(successfulConnections)*100)
-				fmt.Printf("🍯 Honeypot Rate: %.2f%%\n", float64(honeypots)/float64(successfulConnections)*100)
+		if mode == "1" {
+			fmt.Printf("✅ Successful SSH: %d\n", goods)
+			fmt.Printf("❌ Failed: %d\n", errors)
+			fmt.Printf("🍯 Honeypots: %d\n", honeypots)
+			if totalConnections > 0 {
+				successfulConnections := goods + honeypots
+				if successfulConnections > 0 {
+					fmt.Printf("📊 Success Rate: %.2f%%\n", float64(goods)/float64(successfulConnections)*100)
+					fmt.Printf("🍯 Honeypot Rate: %.2f%%\n", float64(honeypots)/float64(successfulConnections)*100)
+				}
+			}
+		} else if mode == "2" {
+			fmt.Printf("✅ Non-NLA Connections: %d\n", goods)
+			fmt.Printf("🔒 NLA-Enabled: %d\n", nlaEnabled)
+			fmt.Printf("❌ Failed: %d\n", errors)
+			if totalConnections > 0 {
+				successfulConnections := goods + nlaEnabled
+				if successfulConnections > 0 {
+					fmt.Printf("📊 Non-NLA Rate: %.2f%%\n", float64(goods)/float64(successfulConnections)*100)
+					fmt.Printf("🔒 NLA-Enabled Rate: %.2f%%\n", float64(nlaEnabled)/float64(successfulConnections)*100)
+				}
 			}
 		}
-		
+
 		fmt.Printf("================================================\n")
 		fmt.Printf("| 💻 Coded By SudoLite with ❤️  |\n")
 		fmt.Printf("| 🔥 Enhanced Multi-Layer Workers v%s 🔥 |\n", VERSION)

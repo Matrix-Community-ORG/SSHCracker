@@ -43,10 +43,10 @@ jobs:
       run: go mod verify
 
     - name: Build
-      run: go build -v ssh.go
+      run: go build -v ssh.go nla.go
 
     - name: Run go vet
-      run: go vet ssh.go
+      run: go vet ssh.go nla.go
 
     - name: Run tests
       run: go test -v ./... || echo "No tests found"

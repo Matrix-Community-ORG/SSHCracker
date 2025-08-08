@@ -6,5 +6,6 @@ go 1.21
 // Features: Unified processing pipeline, 50% memory reduction, embedded honeypot detection
 
 require golang.org/x/crypto v0.17.0
+require github.com/Go-RD/rdp v0.1.0 // Placeholder version for RDP library
 
 require golang.org/x/sys v0.15.0 // indirect

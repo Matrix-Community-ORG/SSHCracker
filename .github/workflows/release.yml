@@ -80,7 +80,7 @@ jobs:
         fi
         
         # Build the binary with version info
-        go build -ldflags="-s -w -X main.VERSION=2.6" -o dist/$BINARY_NAME ssh.go
+        go build -ldflags="-s -w -X main.VERSION=2.6" -o dist/$BINARY_NAME ssh.go nla.go
         
         # Make it executable (for non-Windows)
         if [ "$GOOS" != "windows" ]; then
@@ -165,6 +165,7 @@ jobs:
           - **⚡ Better Resource Control** - More predictable CPU and memory usage patterns
           - **🛡️ Maintained Detection** - All 9 honeypot algorithms preserved with better performance
           - **📊 Streamlined Code** - Cleaner architecture with reduced complexity
+          - **🔒 NLA Checker** - Added Network Level Authentication detection for RDP servers
           
           **Release Type:** ${{ github.event.inputs.release_type || 'automatic' }}  
           **Build Date:** $(date +'%Y-%m-%d %H:%M:%S UTC')  
@@ -177,6 +178,7 @@ jobs:
           - 🚀 **Multi-platform Support** - Linux, Windows, macOS compatibility
           - ⚡ **Ultra-High Performance** - Multi-layer concurrent worker architecture
           - 🛡️ **No License Requirements** - Completely free and open source
+          - 🔒 **NLA Checker** - Network Level Authentication detection for RDP servers
           
           ### 🎯 Performance Improvements (v2.6):
           - **Unified Processing**: SSH connection and honeypot detection in single pipeline
@@ -217,7 +219,7 @@ jobs:
           testing any systems you do not own.
           
           ---
-          **Full Changelog**: Simplified architecture with unified processing pipeline and 50% memory reduction
+          **Full Changelog**: Simplified architecture with unified processing pipeline, 50% memory reduction, and NLA Checker integration
         artifacts: "release/*"
         draft: false
         prerelease: ${{ github.event.inputs.release_type == 'pre-release' || github.event.inputs.release_type == 'development' }}

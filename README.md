@@ -14,6 +14,7 @@ A powerful, high-performance SSH brute force tool written in Go with **enhanced 
 - **⚡ Enhanced Multi-Layer Workers** - Revolutionary concurrent processing architecture
 - **🚀 10x Performance Boost** - Up to 1000+ concurrent connections per worker
 - **🍯 Advanced Honeypot Detection** - 9 intelligent detection algorithms with dedicated workers
+- **🔒 NLA Checker** - Network Level Authentication detection for RDP servers
 - **📊 Real-Time Dashboard** - Live progress tracking with enhanced statistics
 - **🎯 Smart Target Management** - Efficient wordlist and target handling
 - **🔍 Deep System Reconnaissance** - Comprehensive server information gathering
@@ -28,6 +29,7 @@ A powerful, high-performance SSH brute force tool written in Go with **enhanced 
 ## 🆕 What's New in v2.6
 
 ### 🎯 Simplified Architecture & Enhanced Performance
+- **NLA Checker Integration** - Added support for detecting Network Level Authentication in RDP servers
 - **Unified Processing**: Honeypot detection now runs directly in SSH processing pipeline
 - **Eliminated Queue Overhead**: Removed separate honeypot worker queue for better performance
 - **Reduced Memory Usage**: Simplified architecture uses 50% less memory
@@ -78,13 +80,13 @@ go build ssh.go
 
 ### Basic Usage
 1. **Launch the tool**: `./ssh-cracker-*`
-2. **Configure inputs**:
+2. **Select mode**: Choose between SSHCracker (1) or NLA Checker (2)
+3. **Configure inputs**:
    - Username wordlist file (e.g., `users.txt`)
    - Password wordlist file (e.g., `passwords.txt`)
    - Target list file (e.g., `targets.txt`)
    - Connection timeout (recommended: 5-10 seconds)
    - Max concurrent connections (recommended: 10-50)
-
 ### File Format Examples
 
 **Usernames (`users.txt`)**:

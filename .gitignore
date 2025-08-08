@@ -63,3 +63,14 @@ su-goods.txt
 *.swp
 *.swo
 .DS_Store 
+
+# Project specific
+data.json
+combo.txt
+su-goods.txt
+detailed-results.txt
+honeypots.txt
++nla-enabled.txt
++nla-non-enabled.txt
++nla-detailed-results.txt
+*.log
