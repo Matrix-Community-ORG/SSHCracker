@@ -1,4 +1,4 @@
-name: Build and Release SSHCracker v2.6
+name: Build and Release SSHCracker v3.0
 
 on:
   push:
@@ -59,7 +59,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21'
+        go-version: '1.24'
 
     - name: Get dependencies
       run: go mod download
@@ -74,13 +74,13 @@ jobs:
         
         # Set binary name based on OS
         if [ "$GOOS" = "windows" ]; then
-          BINARY_NAME="ssh-cracker-v2.6-$GOOS-$GOARCH.exe"
+          BINARY_NAME="sshcracker-v3.0-$GOOS-$GOARCH.exe"
         else
-          BINARY_NAME="ssh-cracker-v2.6-$GOOS-$GOARCH"
+          BINARY_NAME="sshcracker-v3.0-$GOOS-$GOARCH"
         fi
         
         # Build the binary with version info
-        go build -ldflags="-s -w -X main.VERSION=2.6" -o dist/$BINARY_NAME ssh.go
+        go build -ldflags="-s -w -X main.VERSION=3.0-beta" -o dist/$BINARY_NAME ssh.go
         
         # Make it executable (for non-Windows)
         if [ "$GOOS" != "windows" ]; then
@@ -90,7 +90,7 @@ jobs:
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ssh-cracker-v2.6-${{ matrix.goos }}-${{ matrix.goarch }}
+        name: sshcracker-v3.0-${{ matrix.goos }}-${{ matrix.goarch }}
         path: dist/
 
   release:
@@ -113,13 +113,13 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         path: artifacts
-        pattern: ssh-cracker-v2.6-*
+        pattern: sshcracker-v3.0-*
         merge-multiple: true
 
     - name: Create release directory
       run: |
         mkdir -p release
-        find artifacts -name "ssh-cracker-v2.6-*" -type f -exec cp {} release/ \;
+        find artifacts -name "sshcracker-v3.0-*" -type f -exec cp {} release/ \;
         ls -la release/
 
     - name: Generate release tag
@@ -132,17 +132,21 @@ jobs:
         else
           case "${{ github.event.inputs.release_type }}" in
             "release")
-              echo "tag=v2.6.$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+              echo "tag=v3.0.$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
               ;;
             "pre-release")
-              echo "tag=v2.6.$(date +'%Y.%m.%d')-pre" >> $GITHUB_OUTPUT
+              echo "tag=v3.0-beta.$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
               ;;
             *)
-              echo "tag=v2.6-dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+              echo "tag=v3.0-dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
               ;;
           esac
         fi
         echo "Generated tag: $(cat $GITHUB_OUTPUT | grep tag= | cut -d= -f2)"
+
+    - name: Get build date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
 
     - name: Create Release
       id: create_release
@@ -152,38 +156,52 @@ jobs:
       with:
         tag: ${{ steps.tag.outputs.tag }}
         name: |
-          ${{ github.event.inputs.release_type == 'release' && '🚀 SSHCracker v2.6' || 
-              github.event.inputs.release_type == 'pre-release' && '🧪 SSHCracker v2.6 (Pre-release)' || 
-              '🔧 SSHCracker v2.6 (Development)' }} ${{ steps.tag.outputs.tag }}
+          ${{ github.event.inputs.release_type == 'release' && '🚀 SSHCracker v3.0' || 
+              github.event.inputs.release_type == 'pre-release' && '🧪 SSHCracker v3.0-beta' || 
+              '🔧 SSHCracker v3.0-beta (Development)' }} ${{ steps.tag.outputs.tag }}
         body: |
-          ## 🚀 Advanced SSH Brute Force Tool v2.6
+          ## 🚀 SSHCracker v3.0-beta - Advanced SSH Brute Force Tool
           
-          ### 🆕 What's New in v2.6:
-          - **🎯 Simplified Architecture** - Unified processing pipeline with embedded honeypot detection
-          - **🚀 50% Memory Reduction** - Eliminated separate honeypot worker queue overhead
-          - **💾 Direct Processing** - Honeypot detection integrated directly into SSH processing
-          - **⚡ Better Resource Control** - More predictable CPU and memory usage patterns
-          - **🛡️ Maintained Detection** - All 9 honeypot algorithms preserved with better performance
-          - **📊 Streamlined Code** - Cleaner architecture with reduced complexity
+          ### 🆕 What's New in v3.0-beta:
+          - **🎯 Advanced Honeypot Detection** - 11 sophisticated algorithms (was 9)
+          - **📊 Dynamic Threshold** - Smart threshold calculation based on test results
+          - **⏸️ Pause/Resume** - Press Ctrl+C to pause, use `--resume` to continue
+          - **💾 Auto-save** - State saved every 5 minutes automatically
+          - **🎨 Professional UI** - Interactive prompts with validation (promptui)
+          - **🏳️ CLI Flags** - `--resume`, `--resume-file`, `--help`
+          - **⏱️ Command Timing Analysis** - CV-based timing for honeypot detection
+          - **🔍 SSH Banner Fingerprinting** - Detect honeypot SSH versions
+          - **📘 WIKI Documentation** - Comprehensive English guide
           
           **Release Type:** ${{ github.event.inputs.release_type || 'automatic' }}  
-          **Build Date:** $(date +'%Y-%m-%d %H:%M:%S UTC')  
-          **Triggered by:** ${{ github.event_name }}
+          **Build Date:** ${{ steps.date.outputs.date }}  
+          **Triggered by:** ${{ github.event_name }}  
+          **Developer:** SudoLite (@sudolite)
           
           ### ✨ Core Features:
-          - 🍯 **Advanced Honeypot Detection** - 9 sophisticated algorithms with optimized workers
-          - 📊 **Real-time Dashboard** - Enhanced live progress tracking and statistics
-          - 🔍 **Deep System Reconnaissance** - Comprehensive server information gathering
-          - 🚀 **Multi-platform Support** - Linux, Windows, macOS compatibility
-          - ⚡ **Ultra-High Performance** - Multi-layer concurrent worker architecture
-          - 🛡️ **No License Requirements** - Completely free and open source
+          - 🍯 **Advanced Honeypot Detection** - 11 algorithms with dynamic threshold
+          - ⏸️ **Pause/Resume** - Masscan-style Ctrl+C pause with state persistence
+          - 💾 **Auto-save** - Never lose progress with 5-minute auto-save
+          - 📊 **Real-time Dashboard** - Live progress with aligned UI boxes
+          - 🔍 **Deep Reconnaissance** - Comprehensive server information gathering
+          - 🚀 **Multi-platform** - Linux, Windows, macOS compatibility
+          - ⚡ **High Performance** - Multi-layer concurrent worker architecture
+          - 🛡️ **Open Source** - Completely free, no license required
           
-          ### 🎯 Performance Improvements (v2.6):
-          - **Unified Processing**: SSH connection and honeypot detection in single pipeline
-          - **Memory Efficiency**: 50% reduction in memory usage vs v2.5
-          - **Simplified Architecture**: Removed separate honeypot worker queue
-          - **Better Resource Control**: More predictable CPU and memory patterns
-          - **Speed**: 20-25% faster processing with unified pipeline
+          ### 🎯 Honeypot Detection Algorithms (11):
+          | # | Algorithm | Description |
+          |---|-----------|-------------|
+          | 1 | Command Timing | CV-based response time analysis |
+          | 2 | SSH Banner | Known honeypot version fingerprinting |
+          | 3 | Filesystem | Suspicious paths and fake structures |
+          | 4 | Network Ports | Unusual open port patterns |
+          | 5 | System Info | Fake hostname/OS detection |
+          | 6 | User Enumeration | Invalid user behavior analysis |
+          | 7 | Process List | Missing/fake process detection |
+          | 8 | Command Response | Honeypot signature matching |
+          | 9 | Connection Behavior | Unusual connection patterns |
+          | 10 | Time Consistency | Command timing anomalies |
+          | 11 | Environment | Suspicious environment variables |
           
           ### 📱 Community:
           - 🌐 **English Community**: [@MatrixORG](https://t.me/MatrixORG)
@@ -193,22 +211,31 @@ jobs:
           ### 📦 Available Downloads:
           | Platform | Architecture | File |
           |----------|-------------|------|
-          | 🐧 Linux | AMD64 | `ssh-cracker-v2.6-linux-amd64` |
-          | 🐧 Linux | ARM64 | `ssh-cracker-v2.6-linux-arm64` |
-          | 🪟 Windows | AMD64 | `ssh-cracker-v2.6-windows-amd64.exe` |
-          | 🍎 macOS | Intel | `ssh-cracker-v2.6-darwin-amd64` |
-          | 🍎 macOS | Apple Silicon | `ssh-cracker-v2.6-darwin-arm64` |
+          | 🐧 Linux | AMD64 | `sshcracker-v3.0-linux-amd64` |
+          | 🐧 Linux | ARM64 | `sshcracker-v3.0-linux-arm64` |
+          | 🪟 Windows | AMD64 | `sshcracker-v3.0-windows-amd64.exe` |
+          | 🍎 macOS | Intel | `sshcracker-v3.0-darwin-amd64` |
+          | 🍎 macOS | Apple Silicon | `sshcracker-v3.0-darwin-arm64` |
           
           ### 🛠️ Quick Start:
-          1. **Download** the appropriate binary for your platform
-          2. **Make executable** (Linux/macOS): `chmod +x ssh-cracker-v2.6-*`
-          3. **Run**: `./ssh-cracker-v2.6-*`
-          4. **Follow** the interactive setup prompts
-          5. **Enjoy** the enhanced performance!
+          ```bash
+          # Download and make executable
+          chmod +x sshcracker-v3.0-linux-amd64
+          
+          # Run interactive mode
+          ./sshcracker-v3.0-linux-amd64
+          
+          # Show help
+          ./sshcracker-v3.0-linux-amd64 --help
+          
+          # Resume paused scan
+          ./sshcracker-v3.0-linux-amd64 --resume
+          ```
           
           ### 📖 Documentation:
           - [English README](README.md)
           - [Persian README](README.fa.md)
+          - [WIKI Guide](WIKI.md)
           - [GitHub Repository](https://github.com/Matrix-Community-ORG/SSHCracker)
           
           ### ⚠️ Legal & Ethical Use:
@@ -217,7 +244,7 @@ jobs:
           testing any systems you do not own.
           
           ---
-          **Full Changelog**: Simplified architecture with unified processing pipeline and 50% memory reduction
+          **Full Changelog**: Major update with 11 honeypot algorithms, pause/resume, auto-save, and professional UI
         artifacts: "release/*"
         draft: false
         prerelease: ${{ github.event.inputs.release_type == 'pre-release' || github.event.inputs.release_type == 'development' }}

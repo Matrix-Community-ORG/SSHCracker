@@ -1,4 +1,4 @@
-name: CI - SSHCracker v2.6
+name: CI - SSHCracker v3.0
 
 on:
   push:
@@ -28,13 +28,14 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21'
+        go-version: '1.24'
 
     - name: Print workflow trigger info
       run: |
         echo "Workflow triggered by: ${{ github.event_name }}"
         echo "Branch: ${{ github.ref_name }}"
         echo "Debug mode: ${{ github.event.inputs.debug_enabled }}"
+        echo "SSHCracker v3.0-beta CI"
 
     - name: Get dependencies
       run: go mod download
@@ -48,24 +49,42 @@ jobs:
     - name: Run go vet
       run: go vet ssh.go
 
-    - name: Run tests
-      run: go test -v ./... || echo "No tests found"
-
-    - name: Debug information
-      if: ${{ github.event.inputs.debug_enabled == 'true' }}
+    - name: Check for vulnerabilities
       run: |
-        echo "=== Debug Information ==="
-        echo "Go version: $(go version)"
-        echo "Current directory: $(pwd)"
-        echo "Files in directory:"
-        ls -la
-        echo "Go modules:"
-        go list -m all
-        echo "Environment variables:"
-        env | grep -E "(GO|PATH)" | sort
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
 
-    - name: Run staticcheck
-      uses: dominikh/staticcheck-action@v1.3.0
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
       with:
-        version: "2023.1.6"
-        install-go: false
+        go-version: '1.24'
+
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=5m
+      continue-on-error: true
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24'
+
+    - name: Run Gosec Security Scanner
+      uses: securego/gosec@master
+      with:
+        args: ./...
+      continue-on-error: true
