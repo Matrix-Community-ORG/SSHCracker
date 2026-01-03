@@ -2,9 +2,16 @@ module github.com/Matrix-Community-ORG/SSHCracker
 
 go 1.21
 
-// SSHCracker v2.6 - Simplified Architecture & Enhanced Performance
-// Features: Unified processing pipeline, 50% memory reduction, embedded honeypot detection
+// SSHCracker v3.0-beta - Advanced Honeypot Detection & Professional UX
+// Features: CLI flags, Pause/Resume, Auto-save, Dynamic threshold, Command timing analysis
 
-require golang.org/x/crypto v0.17.0
+require (
+	github.com/manifoldco/promptui v0.9.0
+	github.com/spf13/pflag v1.0.5
+	golang.org/x/crypto v0.17.0
+)
 
-require golang.org/x/sys v0.15.0 // indirect
+require (
+	github.com/chzyer/readline v1.5.1 // indirect
+	golang.org/x/sys v0.15.0 // indirect
+)
