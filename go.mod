@@ -8,10 +8,10 @@ go 1.21
 require (
 	github.com/manifoldco/promptui v0.9.0
 	github.com/spf13/pflag v1.0.5
-	golang.org/x/crypto v0.17.0
+	golang.org/x/crypto v0.31.0
 )
 
 require (
 	github.com/chzyer/readline v1.5.1 // indirect
-	golang.org/x/sys v0.15.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
 )
